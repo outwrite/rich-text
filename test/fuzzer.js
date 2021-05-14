@@ -4,11 +4,14 @@ var fuzzer = require('ot-fuzzer');
 var richText = require('../lib/type');
 var Delta = richText.Delta;
 
+var DEBUG = false;
+
 var FORMATS = {
   color: ['red', 'orange', 'yellow', 'green', 'blue', 'purple', null],
   font: ['serif', 'sans-serif', 'monospace', null],
   bold: [true, null],
-  italic: [true, null]
+  italic: [true, null],
+  detectionId: []
 };
 
 function generateRandomEmbed () {
@@ -20,13 +23,26 @@ function generateRandomEmbed () {
   }
 };
 
-function generateRandomFormat (includeNull) {
+let detId = 0;
+
+function generateRandomFormat (includeNull, detectionIds) {
   var format = {};
   for (var key in FORMATS) {
     if (fuzzer.randomReal() < 0.5) {
-      var value = FORMATS[key][fuzzer.randomInt(FORMATS[key].length)];
-      if (value || includeNull) {
-        format[key] = value;
+      if (key === 'detectionId') {
+        if (fuzzer.randomReal() < 0.8) {
+          while (detectionIds.findIndex((id) => id === detId.toString()) !== -1) {
+            detId++;
+          }
+          format[key] = detId.toString();
+        } else if (includeNull) {
+          format[key] = null;
+        }
+      } else {
+        var value = FORMATS[key][fuzzer.randomInt(FORMATS[key].length)];
+        if (value || includeNull) {
+          format[key] = value;
+        }
       }
     }
   }
@@ -35,14 +51,29 @@ function generateRandomFormat (includeNull) {
 
 function generateRandomOp (snapshot) {
   snapshot = _.cloneDeep(snapshot);
+  var originalDets = {};
   var length = snapshot.ops.reduce(function(length, op) {
     if (!op.insert) {
       console.error(snapshot);
       throw new Error('Snapshot should only have inserts');
     }
+
+    const opLength = (_.isString(op.insert) ? op.insert.length : 1);
+
+    if (op.attributes?.detectionId) {
+      if (originalDets[op.attributes.detectionId]) {
+        originalDets[op.attributes.detectionId] += opLength;
+      } else {
+        originalDets[op.attributes.detectionId] = opLength;
+      }
+    }
+
     // Snapshot should only have inserts
-    return length + (_.isString(op.insert) ? op.insert.length : 1);
+    return length + opLength;
   }, 0);
+
+  DEBUG && console.log('snap', snapshot.ops);
+  DEBUG && console.log('og', originalDets);
 
   var base = length > 100 ? 10 : 7; // Favor deleting on long documents
   var delta = new Delta();
@@ -70,19 +101,19 @@ function generateRandomOp (snapshot) {
       case 1:
         // Insert formatted text
         var word = fuzzer.randomWord();
-        var formats = generateRandomFormat(false);
+        var formats = generateRandomFormat(false, Object.keys(originalDets));
         delta.insert(word, formats);
         result.insert(word, formats);
         break;
       case 2:
         // Insert embed
         var type = generateRandomEmbed();
-        var formats = generateRandomFormat(false);
+        var formats = generateRandomFormat(false, Object.keys(originalDets));
         delta.insert(type, formats);
         result.insert(type, formats);
         break;
       case 3: case 4:
-        var attributes = generateRandomFormat(true);
+        var attributes = generateRandomFormat(true, Object.keys(originalDets));
         delta.retain(modLength, attributes);
         ops = next(snapshot, modLength);
         for (var i in ops) {
@@ -114,7 +145,68 @@ function generateRandomOp (snapshot) {
     result.push(snapshot.ops[i]);
   }
 
-  return [delta, result];
+
+  // Validate detections....
+  var resultDets = {};
+  result.ops.reduce((length, op) => {
+    if (!op.insert) {
+      console.error(result);
+      throw new Error('Result should only have inserts');
+    }
+
+    const opLength = (_.isString(op.insert) ? op.insert.length : 1);
+    if (op.attributes?.detectionId) {
+      if (resultDets[op.attributes.detectionId]) {
+        resultDets[op.attributes.detectionId].opLength += opLength;
+        resultDets[op.attributes.detectionId].appearences.push({ start: length, end: length + opLength });
+      } else {
+        resultDets[op.attributes.detectionId] = { opLength, appearences: [{ start: length, end: length + opLength }] };
+      }
+    }
+    return length + opLength;
+  }, 0);
+
+  const needToDelete = Object.keys(resultDets).filter((detId) => {
+    if (originalDets[detId]) {
+      if (originalDets[detId] !== resultDets[detId].opLength) {
+        return true;
+      } else {
+        const firstAppearence = resultDets[detId].appearences[0];
+        const lastAppearence = resultDets[detId].appearences[resultDets[detId].appearences.length - 1];
+        return resultDets[detId].opLength !== lastAppearence.end - firstAppearence.start;
+      }
+    } else {
+      return false;
+    }
+  });
+
+  DEBUG && console.log('delta', delta.ops)
+
+  if (needToDelete.length === 0) {
+    DEBUG && console.log('no validation')
+    DEBUG && console.log('res', result.ops)
+    DEBUG && console.log('dets', resultDets);
+    return [delta, result];
+  }
+
+  DEBUG && console.log('has validation', needToDelete);
+
+  const cloned = _.cloneDeep(result);
+  const validatedResult = new Delta();
+  cloned.ops.forEach((op) => {
+    const deleteDet = needToDelete.findIndex((id) => id === op.attributes?.detectionId);
+    if (deleteDet === -1) {
+      validatedResult.push(op);
+    } else {
+      var newAttr = op.attributes
+      delete newAttr['detectionId'];
+      validatedResult.insert(op.insert, Object.keys(newAttr).length > 0 ? newAttr : undefined);
+    }
+  })
+
+  DEBUG && console.log('res', validatedResult.ops);
+
+  return [delta, validatedResult];
 };
 
 function next (snapshot, length) {
