@@ -3,6 +3,7 @@ var expect = require('chai').expect;
 var fuzzer = require('ot-fuzzer');
 var richText = require('../lib/type');
 var Delta = richText.Delta;
+const { v4: uuidv4 } = require('uuid');
 
 var DEBUG = false;
 
@@ -31,10 +32,7 @@ function generateRandomFormat (includeNull, detectionIds) {
     if (fuzzer.randomReal() < 0.5) {
       if (key === 'detectionId') {
         if (fuzzer.randomReal() < 0.8) {
-          while (detectionIds.findIndex((id) => id === detId.toString()) !== -1) {
-            detId++;
-          }
-          format[key] = detId.toString();
+          format[key] = uuidv4()
         } else if (includeNull) {
           format[key] = null;
         }
